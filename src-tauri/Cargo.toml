@@ -1,0 +1,28 @@
+[package]
+name = "myvoice"
+version = "0.1.0"
+description = "Privacy-first voice dictation"
+authors = ["you"]
+edition = "2021"
+
+[lib]
+name = "myvoice_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+tauri-plugin-global-shortcut = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+cpal = "0.15"
+whisper-rs = "0.13"
+hound = "3.5"
+dirs = "5"
+ureq = { version = "2", features = ["tls"] }
+anyhow = "1"
+enigo = "0.2"
+arboard = "3"

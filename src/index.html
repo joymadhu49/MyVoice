@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="stylesheet" href="styles.css" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>MyVoice</title>
+    <script type="module" src="/main.js" defer></script>
+    <style>
+      body { font-family: system-ui, sans-serif; max-width: 640px; margin: 2rem auto; padding: 0 1rem; }
+      button { font-size: 1.1rem; padding: 0.6rem 1.2rem; border-radius: 6px; cursor: pointer; }
+      #rec.on { background: #d33; color: white; }
+      #out { margin-top: 1.5rem; padding: 1rem; border: 1px solid #ccc; border-radius: 6px; min-height: 4rem; white-space: pre-wrap; }
+      #status { color: #666; margin-top: 0.5rem; font-size: 0.9rem; }
+    </style>
+  </head>
+  <body>
+    <h1>MyVoice</h1>
+    <p>Privacy-first voice dictation. All processing local.</p>
+    <p><b>Hotkey:</b> Ctrl+Alt+Space — toggle recording from any window. Text auto-types into focused field + copies to clipboard.</p>
+    <button id="rec">Start recording</button>
+    <div id="status"></div>
+    <div id="out"></div>
+  </body>
+</html>
