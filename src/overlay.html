@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>MyVoice HUD</title>
+    <link rel="stylesheet" href="overlay.css" />
+    <script type="module" src="/overlay.js" defer></script>
+  </head>
+  <body>
+    <div id="hud" class="hud" data-state="idle">
+      <div class="pill idle-pill">
+        <span class="label">Dictate</span>
+        <span class="kbd"><span class="caret">⌃</span> Ctrl</span>
+        <span class="plus">+</span>
+        <span class="kbd"><span class="caret">⇧</span> Shift</span>
+      </div>
+      <div class="pill rec-pill">
+        <div class="dots">
+          <span></span><span></span><span></span><span></span><span></span>
+          <span></span><span></span><span></span>
+        </div>
+      </div>
+      <div class="pill done-pill">
+        <span class="check">✓</span>
+        <span class="done-text">Pasted</span>
+      </div>
+    </div>
+  </body>
+</html>

@@ -2,24 +2,190 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <link rel="stylesheet" href="styles.css" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>MyVoice</title>
+    <link rel="stylesheet" href="styles.css" />
     <script type="module" src="/main.js" defer></script>
-    <style>
-      body { font-family: system-ui, sans-serif; max-width: 640px; margin: 2rem auto; padding: 0 1rem; }
-      button { font-size: 1.1rem; padding: 0.6rem 1.2rem; border-radius: 6px; cursor: pointer; }
-      #rec.on { background: #d33; color: white; }
-      #out { margin-top: 1.5rem; padding: 1rem; border: 1px solid #ccc; border-radius: 6px; min-height: 4rem; white-space: pre-wrap; }
-      #status { color: #666; margin-top: 0.5rem; font-size: 0.9rem; }
-    </style>
   </head>
-  <body>
-    <h1>MyVoice</h1>
-    <p>Privacy-first voice dictation. All processing local.</p>
-    <p><b>Hotkey:</b> Ctrl+Alt+Space — toggle recording from any window. Text auto-types into focused field + copies to clipboard.</p>
-    <button id="rec">Start recording</button>
-    <div id="status"></div>
-    <div id="out"></div>
+  <body class="with-sidebar">
+    <aside class="sidebar">
+      <button class="nav-btn active" data-tab="home" title="Home">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>
+      </button>
+      <button class="nav-btn" data-tab="stats" title="Stats">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19V5M10 19V11M16 19V8M22 19V13"/></svg>
+      </button>
+      <button class="nav-btn" data-tab="profile" title="Voice profile">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 14a4 4 0 0 0 4-4V6a4 4 0 1 0-8 0v4a4 4 0 0 0 4 4Z"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg>
+      </button>
+      <div class="spacer"></div>
+      <button class="nav-btn" data-tab="settings" title="Settings">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1Z"/></svg>
+      </button>
+    </aside>
+
+    <main class="main">
+      <div class="col">
+        <div class="welcome" id="welcome">Welcome back</div>
+
+        <div id="home-tab">
+          <div class="hero-card">
+            <h2><em>Hold</em> the hotkey, speak, release.</h2>
+            <p>Dictation runs locally on Whisper or via Groq cloud. Auto-pastes into the focused window and copies to clipboard.</p>
+            <div class="actions">
+              <button class="pill-btn" id="rec">Start recording</button>
+              <span class="row" style="gap:6px;color:#d8d2ee;font-size:13px;">
+                <span class="kbd" style="background:rgba(255,255,255,0.15);border-color:transparent;color:white;">⌃ Ctrl</span>
+                <span>+</span>
+                <span class="kbd" style="background:rgba(255,255,255,0.15);border-color:transparent;color:white;">⇧ Shift</span>
+                <span>+</span>
+                <span class="kbd" style="background:rgba(255,255,255,0.15);border-color:transparent;color:white;">Space</span>
+              </span>
+            </div>
+          </div>
+          <div id="status"></div>
+          <div id="history-container"></div>
+        </div>
+
+        <div id="stats-tab" style="display:none;">
+          <div class="card stats-card">
+            <h3>All-time stats</h3>
+            <div class="stat"><span class="label">Total words</span><span class="value" id="stat-words-2">0</span></div>
+            <div class="stat"><span class="label">Words per minute (avg)</span><span class="value" id="stat-wpm-2">0</span></div>
+            <div class="stat"><span class="label">Day streak</span><span class="value" id="stat-streak-2">0</span></div>
+            <div class="stat"><span class="label">Total sessions</span><span class="value" id="stat-sessions">0</span></div>
+          </div>
+        </div>
+
+        <div id="profile-tab" style="display:none;">
+          <div class="card">
+            <h3>Voice profile</h3>
+            <p class="muted small">Top words from recent dictations are sent to Whisper as a context prompt — biases recognition toward terms you actually use (names, jargon, acronyms).</p>
+            <div style="margin-top:12px;font-family:ui-monospace,Menlo,monospace;font-size:12px;color:var(--muted);background:var(--panel-2);border:1px solid var(--border);border-radius:10px;padding:12px;-webkit-user-select:text;user-select:text;" id="profile-words">(empty — dictate a few times to build profile)</div>
+            <div class="muted small" style="margin-top:10px;">More dictations → more accurate biasing. Cleared with history.</div>
+          </div>
+        </div>
+
+        <div id="settings-tab" style="display:none;">
+          <div class="card">
+            <h3>Hotkey</h3>
+            <div class="hotkey-row">
+              <span class="label">Push to talk:</span>
+              <span class="kbd">⌃ Ctrl</span>
+              <span>+</span>
+              <span class="kbd">⇧ Shift</span>
+              <span>+</span>
+              <span class="kbd">Space</span>
+            </div>
+            <div class="muted small" style="margin-top:8px;">Hold to record. Release to transcribe + auto-paste.</div>
+          </div>
+
+          <div class="card" style="margin-top:18px;">
+            <h3>Transcription provider</h3>
+            <div class="field">
+              <label>Provider</label>
+              <div class="row">
+                <label class="row" style="gap:6px;">
+                  <input type="radio" name="provider" value="local" />
+                  <span>Local Whisper (offline, private)</span>
+                </label>
+                <label class="row" style="gap:6px;">
+                  <input type="radio" name="provider" value="groq" />
+                  <span>Groq Cloud (whisper-large-v3, fastest + most accurate)</span>
+                </label>
+              </div>
+            </div>
+            <div id="groq-section" style="display:none;">
+              <div class="field">
+                <label>Groq API key</label>
+                <div class="row">
+                  <input id="groq-key" type="text" placeholder="gsk_..." style="flex:1;min-width:280px;" />
+                  <button id="groq-test" class="btn">Test key</button>
+                </div>
+                <div class="muted small">Get one free at <a href="https://console.groq.com/keys" target="_blank">console.groq.com/keys</a>. Stored locally in settings.json.</div>
+              </div>
+              <div class="field">
+                <label>Groq model</label>
+                <select id="groq-model"></select>
+                <div class="muted small">Turbo = fastest. v3 = most accurate. distil-en = English-only, smallest latency.</div>
+              </div>
+              <div id="groq-status" class="muted small"></div>
+            </div>
+          </div>
+
+          <div class="card" style="margin-top:18px;">
+            <h3>Behavior</h3>
+            <div class="field">
+              <label>Language</label>
+              <select id="lang">
+                <option value="auto">Auto detect (multilingual model only)</option>
+                <option value="en">English</option>
+                <option value="es">Spanish</option>
+                <option value="fr">French</option>
+                <option value="de">German</option>
+                <option value="hi">Hindi</option>
+                <option value="bn">Bengali</option>
+                <option value="zh">Chinese</option>
+                <option value="ja">Japanese</option>
+                <option value="ko">Korean</option>
+                <option value="pt">Portuguese</option>
+                <option value="ru">Russian</option>
+                <option value="ar">Arabic</option>
+                <option value="it">Italian</option>
+              </select>
+              <div class="muted small">English-only models ignore this and force English.</div>
+            </div>
+            <div class="field row" style="align-items:center;">
+              <input id="auto-paste" type="checkbox" />
+              <label for="auto-paste" style="margin:0;text-transform:none;letter-spacing:0;font-size:14px;color:var(--text);font-weight:500;">Auto-paste transcript into focused window (also copies to clipboard)</label>
+            </div>
+          </div>
+
+          <div class="card" style="margin-top:18px;">
+            <h3>Local models</h3>
+            <div id="models" class="model-list"></div>
+            <div id="settings-status" class="status-line" style="margin-top:12px;"></div>
+          </div>
+
+          <div class="card" style="margin-top:18px;">
+            <h3>History</h3>
+            <div class="row">
+              <button class="btn danger" id="clear-history">Clear all history</button>
+              <span class="muted small">Removes voice profile + stats. Cannot be undone.</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <aside class="col" id="right-col">
+        <div class="card stats-card">
+          <h3>Your stats</h3>
+          <div class="stat">
+            <span class="label">total words</span>
+            <span class="value" id="stat-words">0</span>
+          </div>
+          <div class="stat">
+            <span class="label">wpm</span>
+            <span class="value" id="stat-wpm">0</span>
+          </div>
+          <div class="stat">
+            <span class="label">day streak</span>
+            <span class="value" id="stat-streak">0</span>
+          </div>
+        </div>
+
+        <div class="card profile-card">
+          <h3>Your Voice Profile</h3>
+          <div id="profile-status" class="muted small">Keep using MyVoice for new insights</div>
+          <div class="progress"><div class="bar" id="profile-bar" style="width:5%"></div></div>
+          <div class="small" id="profile-info">Updates with each dictation</div>
+        </div>
+
+        <div class="card">
+          <h3>Active provider</h3>
+          <div id="provider-info" class="small muted">—</div>
+        </div>
+      </aside>
+    </main>
   </body>
 </html>

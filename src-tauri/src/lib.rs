@@ -1,20 +1,113 @@
+use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::SampleFormat;
-use enigo::{Enigo, Keyboard, Settings};
-use tauri::{AppHandle, Emitter, Manager, State};
+use enigo::{Enigo, Keyboard, Settings as EnigoSettings};
+use serde::{Deserialize, Serialize};
+use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, State};
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
-const MODEL_URL: &str =
-    "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin";
+#[derive(Clone, Serialize)]
+struct ModelInfo {
+    id: &'static str,
+    label: &'static str,
+    size_mb: u32,
+    url: &'static str,
+    lang: &'static str,
+}
+
+const MODELS: &[ModelInfo] = &[
+    ModelInfo {
+        id: "tiny.en",
+        label: "Tiny (English) — 75 MB, fastest",
+        size_mb: 75,
+        url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.en.bin",
+        lang: "en",
+    },
+    ModelInfo {
+        id: "base.en",
+        label: "Base (English) — 142 MB, balanced",
+        size_mb: 142,
+        url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin",
+        lang: "en",
+    },
+    ModelInfo {
+        id: "small.en",
+        label: "Small (English) — 466 MB, accurate",
+        size_mb: 466,
+        url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.en.bin",
+        lang: "en",
+    },
+    ModelInfo {
+        id: "tiny",
+        label: "Tiny (Multilingual) — 75 MB",
+        size_mb: 75,
+        url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.bin",
+        lang: "multi",
+    },
+    ModelInfo {
+        id: "base",
+        label: "Base (Multilingual) — 142 MB",
+        size_mb: 142,
+        url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin",
+        lang: "multi",
+    },
+    ModelInfo {
+        id: "small",
+        label: "Small (Multilingual) — 466 MB",
+        size_mb: 466,
+        url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.bin",
+        lang: "multi",
+    },
+];
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct AppSettings {
+    active_model: String,
+    language: String,
+    auto_paste: bool,
+    #[serde(default = "default_provider")]
+    provider: String, // "local" | "groq"
+    #[serde(default)]
+    groq_api_key: String,
+    #[serde(default = "default_groq_model")]
+    groq_model: String, // e.g. "whisper-large-v3-turbo"
+}
+
+fn default_provider() -> String {
+    "local".into()
+}
+fn default_groq_model() -> String {
+    "whisper-large-v3-turbo".into()
+}
+
+impl Default for AppSettings {
+    fn default() -> Self {
+        Self {
+            active_model: "base.en".into(),
+            language: "en".into(),
+            auto_paste: true,
+            provider: default_provider(),
+            groq_api_key: String::new(),
+            groq_model: default_groq_model(),
+        }
+    }
+}
+
+const GROQ_MODELS: &[&str] = &[
+    "whisper-large-v3-turbo",
+    "whisper-large-v3",
+    "distil-whisper-large-v3-en",
+];
 
 struct Session {
     stop: Arc<AtomicBool>,
@@ -22,32 +115,417 @@ struct Session {
     sample_rate: Arc<Mutex<u32>>,
     channels: Arc<Mutex<u16>>,
     handle: Option<thread::JoinHandle<()>>,
+    started_at: Instant,
 }
 
 #[derive(Default)]
 struct AppState {
     session: Mutex<Option<Session>>,
-    whisper: Mutex<Option<WhisperContext>>,
+    whisper: Mutex<Option<(String, WhisperContext)>>,
+    settings: Mutex<AppSettings>,
 }
 
-fn model_path() -> Result<PathBuf> {
+fn data_dir() -> Result<PathBuf> {
     let dir = dirs::data_dir()
         .ok_or_else(|| anyhow!("no data dir"))?
         .join("myvoice");
     fs::create_dir_all(&dir)?;
-    Ok(dir.join("ggml-base.en.bin"))
+    Ok(dir)
 }
 
-fn ensure_model() -> Result<PathBuf> {
-    let p = model_path()?;
-    if p.exists() && fs::metadata(&p)?.len() > 140_000_000 {
-        return Ok(p);
+fn settings_path() -> Result<PathBuf> {
+    Ok(data_dir()?.join("settings.json"))
+}
+
+fn history_path() -> Result<PathBuf> {
+    Ok(data_dir()?.join("history.jsonl"))
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct HistoryEntry {
+    id: String,
+    ts: u64,
+    text: String,
+    duration_ms: u64,
+    provider: String,
+    model: String,
+    words: u32,
+    #[serde(default)]
+    flagged: bool,
+}
+
+fn append_history(entry: &HistoryEntry) -> Result<()> {
+    let p = history_path()?;
+    let mut f = fs::OpenOptions::new().create(true).append(true).open(p)?;
+    f.write_all(serde_json::to_string(entry)?.as_bytes())?;
+    f.write_all(b"\n")?;
+    Ok(())
+}
+
+fn read_history_all() -> Vec<HistoryEntry> {
+    let p = match history_path() {
+        Ok(p) => p,
+        _ => return vec![],
+    };
+    let f = match fs::File::open(&p) {
+        Ok(f) => f,
+        _ => return vec![],
+    };
+    BufReader::new(f)
+        .lines()
+        .filter_map(|l| l.ok())
+        .filter_map(|l| serde_json::from_str::<HistoryEntry>(&l).ok())
+        .collect()
+}
+
+fn write_history_all(items: &[HistoryEntry]) -> Result<()> {
+    let p = history_path()?;
+    let tmp = p.with_extension("part");
+    let mut f = fs::File::create(&tmp)?;
+    for e in items {
+        f.write_all(serde_json::to_string(e)?.as_bytes())?;
+        f.write_all(b"\n")?;
     }
-    let resp = ureq::get(MODEL_URL).call()?;
-    let mut reader = resp.into_reader();
-    let mut file = fs::File::create(&p)?;
-    std::io::copy(&mut reader, &mut file)?;
-    Ok(p)
+    drop(f);
+    fs::rename(tmp, p)?;
+    Ok(())
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn count_words(text: &str) -> u32 {
+    text.split_whitespace().count() as u32
+}
+
+fn compute_streak(items: &[HistoryEntry]) -> u32 {
+    let secs_per_day = 86_400u64;
+    let now = now_secs();
+    let today = now / secs_per_day;
+    let days: HashSet<u64> = items.iter().map(|e| e.ts / secs_per_day).collect();
+    let mut streak = 0u32;
+    let mut d = today;
+    loop {
+        if days.contains(&d) {
+            streak += 1;
+            if d == 0 {
+                break;
+            }
+            d -= 1;
+        } else {
+            break;
+        }
+    }
+    streak
+}
+
+fn voice_profile_prompt() -> String {
+    let items = read_history_all();
+    if items.len() < 3 {
+        return String::new();
+    }
+    let mut counts: HashMap<String, u32> = HashMap::new();
+    for e in items.iter().rev().take(300) {
+        for w in e
+            .text
+            .split(|c: char| !c.is_alphanumeric() && c != '\'')
+        {
+            let w = w.trim().to_lowercase();
+            if w.len() < 4 {
+                continue;
+            }
+            *counts.entry(w).or_insert(0) += 1;
+        }
+    }
+    let mut v: Vec<_> = counts.into_iter().collect();
+    v.sort_by(|a, b| b.1.cmp(&a.1));
+    let mut out = String::new();
+    for (w, _) in v.iter().take(80) {
+        if out.len() + w.len() + 2 > 220 {
+            break;
+        }
+        if !out.is_empty() {
+            out.push_str(", ");
+        }
+        out.push_str(w);
+    }
+    out
+}
+
+#[tauri::command]
+fn list_history(limit: Option<usize>) -> Vec<HistoryEntry> {
+    let mut items = read_history_all();
+    items.reverse();
+    if let Some(n) = limit {
+        items.truncate(n);
+    }
+    items
+}
+
+#[tauri::command]
+fn delete_history_item(id: String) -> Result<(), String> {
+    let items: Vec<HistoryEntry> = read_history_all()
+        .into_iter()
+        .filter(|e| e.id != id)
+        .collect();
+    write_history_all(&items).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn flag_history_item(id: String) -> Result<(), String> {
+    let mut items = read_history_all();
+    for e in items.iter_mut() {
+        if e.id == id {
+            e.flagged = !e.flagged;
+        }
+    }
+    write_history_all(&items).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn clear_history() -> Result<(), String> {
+    write_history_all(&[]).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn get_stats() -> serde_json::Value {
+    let items = read_history_all();
+    let total_words: u64 = items.iter().map(|e| e.words as u64).sum();
+    let total_ms: u64 = items.iter().map(|e| e.duration_ms).sum();
+    let wpm = if total_ms > 0 {
+        (total_words as f64 / (total_ms as f64 / 60_000.0)).round() as u64
+    } else {
+        0
+    };
+    serde_json::json!({
+        "total_words": total_words,
+        "wpm": wpm,
+        "streak": compute_streak(&items),
+        "sessions": items.len(),
+        "voice_profile_size": voice_profile_prompt().len(),
+    })
+}
+
+fn load_settings() -> AppSettings {
+    settings_path()
+        .ok()
+        .and_then(|p| fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_settings(s: &AppSettings) -> Result<()> {
+    let p = settings_path()?;
+    fs::write(p, serde_json::to_string_pretty(s)?)?;
+    Ok(())
+}
+
+fn model_file(id: &str) -> Result<PathBuf> {
+    Ok(data_dir()?.join(format!("ggml-{}.bin", id)))
+}
+
+fn find_model(id: &str) -> Option<&'static ModelInfo> {
+    MODELS.iter().find(|m| m.id == id)
+}
+
+fn model_exists(id: &str) -> bool {
+    let p = match model_file(id) {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    let info = match find_model(id) {
+        Some(i) => i,
+        None => return false,
+    };
+    fs::metadata(&p)
+        .map(|m| m.len() > (info.size_mb as u64).saturating_mul(900_000))
+        .unwrap_or(false)
+}
+
+#[derive(Clone, Serialize)]
+struct ModelStatus {
+    id: String,
+    label: String,
+    size_mb: u32,
+    lang: String,
+    downloaded: bool,
+    active: bool,
+}
+
+#[tauri::command]
+fn list_models(state: State<'_, AppState>) -> Vec<ModelStatus> {
+    let active = state.settings.lock().unwrap().active_model.clone();
+    MODELS
+        .iter()
+        .map(|m| ModelStatus {
+            id: m.id.into(),
+            label: m.label.into(),
+            size_mb: m.size_mb,
+            lang: m.lang.into(),
+            downloaded: model_exists(m.id),
+            active: m.id == active,
+        })
+        .collect()
+}
+
+#[tauri::command]
+fn get_settings(state: State<'_, AppState>) -> AppSettings {
+    state.settings.lock().unwrap().clone()
+}
+
+#[tauri::command]
+fn update_settings(
+    state: State<'_, AppState>,
+    settings: AppSettings,
+) -> Result<AppSettings, String> {
+    {
+        let mut g = state.settings.lock().unwrap();
+        *g = settings.clone();
+    }
+    save_settings(&settings).map_err(|e| e.to_string())?;
+    Ok(settings)
+}
+
+#[tauri::command]
+async fn set_active_model(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<AppSettings, String> {
+    if find_model(&id).is_none() {
+        return Err(format!("unknown model: {}", id));
+    }
+    if !model_exists(&id) {
+        return Err(format!("model not downloaded: {}", id));
+    }
+    let new = {
+        let mut g = state.settings.lock().unwrap();
+        g.active_model = id;
+        g.clone()
+    };
+    save_settings(&new).map_err(|e| e.to_string())?;
+    {
+        let mut w = state.whisper.lock().unwrap();
+        *w = None;
+    }
+    let _ = app.emit("settings-changed", &new);
+    Ok(new)
+}
+
+#[tauri::command]
+fn download_model(app: AppHandle, id: String) -> Result<(), String> {
+    let info = find_model(&id).ok_or_else(|| format!("unknown model: {}", id))?;
+    let path = model_file(&id).map_err(|e| e.to_string())?;
+    if model_exists(&id) {
+        let _ = app.emit(
+            "model-progress",
+            serde_json::json!({"id": id, "done": true, "bytes": 0, "total": 0, "error": null}),
+        );
+        return Ok(());
+    }
+    let url = info.url;
+    let id_clone = id.clone();
+    let app_clone = app.clone();
+    thread::spawn(move || {
+        let do_download = || -> Result<u64, String> {
+            let resp = ureq::get(url).call().map_err(|e| e.to_string())?;
+            let total: u64 = resp
+                .header("Content-Length")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            let tmp = path.with_extension("part");
+            let mut file = fs::File::create(&tmp).map_err(|e| e.to_string())?;
+            let mut reader = resp.into_reader();
+            let mut buf = vec![0u8; 256 * 1024];
+            let mut got: u64 = 0;
+            let mut last_emit = Instant::now();
+            loop {
+                let n = match reader.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => n,
+                    Err(e) => return Err(e.to_string()),
+                };
+                std::io::Write::write_all(&mut file, &buf[..n]).map_err(|e| e.to_string())?;
+                got += n as u64;
+                if last_emit.elapsed() > Duration::from_millis(200) {
+                    let _ = app_clone.emit(
+                        "model-progress",
+                        serde_json::json!({
+                            "id": id_clone,
+                            "bytes": got,
+                            "total": total,
+                            "done": false,
+                            "error": null,
+                        }),
+                    );
+                    last_emit = Instant::now();
+                }
+            }
+            drop(file);
+            fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
+            Ok(got)
+        };
+        match do_download() {
+            Ok(got) => {
+                let _ = app_clone.emit(
+                    "model-progress",
+                    serde_json::json!({
+                        "id": id,
+                        "bytes": got,
+                        "total": got,
+                        "done": true,
+                        "error": null,
+                    }),
+                );
+            }
+            Err(e) => {
+                let _ = app_clone.emit(
+                    "model-progress",
+                    serde_json::json!({
+                        "id": id,
+                        "bytes": 0,
+                        "total": 0,
+                        "done": true,
+                        "error": e,
+                    }),
+                );
+            }
+        }
+    });
+    Ok(())
+}
+
+#[tauri::command]
+fn delete_model(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    let active = state.settings.lock().unwrap().active_model.clone();
+    if active == id {
+        return Err("cannot delete active model".into());
+    }
+    let p = model_file(&id).map_err(|e| e.to_string())?;
+    if p.exists() {
+        fs::remove_file(&p).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+fn ensure_active_model(state: &AppState) -> Result<(PathBuf, String)> {
+    let id = state.settings.lock().unwrap().active_model.clone();
+    let info = find_model(&id).ok_or_else(|| anyhow!("unknown model: {}", id))?;
+    let p = model_file(&id)?;
+    if !model_exists(&id) {
+        let resp = ureq::get(info.url).call()?;
+        let mut reader = resp.into_reader();
+        let tmp = p.with_extension("part");
+        let mut file = fs::File::create(&tmp)?;
+        std::io::copy(&mut reader, &mut file)?;
+        drop(file);
+        fs::rename(&tmp, &p)?;
+    }
+    Ok((p, id))
 }
 
 fn start_inner(state: &AppState) -> Result<(), String> {
@@ -127,8 +605,145 @@ fn start_inner(state: &AppState) -> Result<(), String> {
         sample_rate: sr,
         channels: ch,
         handle: Some(handle),
+        started_at: Instant::now(),
     });
     Ok(())
+}
+
+fn normalize_peak(samples: &mut [f32]) {
+    let peak = samples.iter().fold(0.0_f32, |a, &x| a.max(x.abs()));
+    if peak < 0.001 || peak >= 0.95 {
+        return;
+    }
+    let gain = 0.95 / peak;
+    let gain = gain.min(8.0); // cap gain to avoid amplifying pure noise
+    for s in samples.iter_mut() {
+        *s *= gain;
+    }
+}
+
+fn trim_silence(samples: &[f32], sample_rate: u32) -> Vec<f32> {
+    if samples.is_empty() {
+        return Vec::new();
+    }
+    let win = (sample_rate as usize / 50).max(160); // ~20ms window
+    let threshold = 0.012_f32;
+    let energy = |chunk: &[f32]| -> f32 {
+        let sum_sq: f32 = chunk.iter().map(|x| x * x).sum();
+        (sum_sq / chunk.len() as f32).sqrt()
+    };
+    let mut start = 0usize;
+    let mut end = samples.len();
+    let mut i = 0;
+    while i + win <= samples.len() {
+        if energy(&samples[i..i + win]) > threshold {
+            start = i.saturating_sub(win * 4); // keep ~80ms padding
+            break;
+        }
+        i += win;
+    }
+    if i + win > samples.len() {
+        return samples.to_vec();
+    }
+    let mut j = samples.len().saturating_sub(win);
+    loop {
+        if energy(&samples[j..(j + win).min(samples.len())]) > threshold {
+            end = (j + win * 4).min(samples.len());
+            break;
+        }
+        if j == 0 {
+            break;
+        }
+        j = j.saturating_sub(win);
+    }
+    if end <= start {
+        return samples.to_vec();
+    }
+    samples[start..end].to_vec()
+}
+
+fn pcm16_wav_bytes(pcm: &[f32], sample_rate: u32) -> Result<Vec<u8>> {
+    use std::io::Cursor;
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut buf = Cursor::new(Vec::<u8>::new());
+    {
+        let mut w = hound::WavWriter::new(&mut buf, spec)?;
+        for &s in pcm {
+            let v = (s.clamp(-1.0, 1.0) * 32767.0) as i16;
+            w.write_sample(v)?;
+        }
+        w.finalize()?;
+    }
+    Ok(buf.into_inner())
+}
+
+fn transcribe_groq(
+    pcm: &[f32],
+    sample_rate: u32,
+    api_key: &str,
+    model: &str,
+    language: &str,
+    prompt: &str,
+) -> Result<String, String> {
+    if api_key.trim().is_empty() {
+        return Err("Groq API key not set".into());
+    }
+    let wav = pcm16_wav_bytes(pcm, sample_rate).map_err(|e| e.to_string())?;
+    let boundary = format!("----myvoice{:x}", std::process::id());
+    let mut body: Vec<u8> = Vec::with_capacity(wav.len() + 1024);
+    body.extend_from_slice(format!("--{}\r\n", boundary).as_bytes());
+    body.extend_from_slice(b"Content-Disposition: form-data; name=\"model\"\r\n\r\n");
+    body.extend_from_slice(model.as_bytes());
+    body.extend_from_slice(b"\r\n");
+    if !language.is_empty() && language != "auto" {
+        body.extend_from_slice(format!("--{}\r\n", boundary).as_bytes());
+        body.extend_from_slice(b"Content-Disposition: form-data; name=\"language\"\r\n\r\n");
+        body.extend_from_slice(language.as_bytes());
+        body.extend_from_slice(b"\r\n");
+    }
+    body.extend_from_slice(format!("--{}\r\n", boundary).as_bytes());
+    body.extend_from_slice(b"Content-Disposition: form-data; name=\"response_format\"\r\n\r\n");
+    body.extend_from_slice(b"json");
+    body.extend_from_slice(b"\r\n");
+    if !prompt.trim().is_empty() {
+        body.extend_from_slice(format!("--{}\r\n", boundary).as_bytes());
+        body.extend_from_slice(b"Content-Disposition: form-data; name=\"prompt\"\r\n\r\n");
+        body.extend_from_slice(prompt.as_bytes());
+        body.extend_from_slice(b"\r\n");
+    }
+    body.extend_from_slice(format!("--{}\r\n", boundary).as_bytes());
+    body.extend_from_slice(b"Content-Disposition: form-data; name=\"file\"; filename=\"audio.wav\"\r\nContent-Type: audio/wav\r\n\r\n");
+    body.extend_from_slice(&wav);
+    body.extend_from_slice(b"\r\n");
+    body.extend_from_slice(format!("--{}--\r\n", boundary).as_bytes());
+
+    let resp = ureq::post("https://api.groq.com/openai/v1/audio/transcriptions")
+        .set("Authorization", &format!("Bearer {}", api_key))
+        .set(
+            "Content-Type",
+            &format!("multipart/form-data; boundary={}", boundary),
+        )
+        .send_bytes(&body)
+        .map_err(|e| match e {
+            ureq::Error::Status(code, r) => {
+                let msg = r.into_string().unwrap_or_default();
+                format!("Groq HTTP {}: {}", code, msg)
+            }
+            ureq::Error::Transport(t) => format!("Groq transport: {}", t),
+        })?;
+    let text = resp.into_string().map_err(|e| e.to_string())?;
+    let val: serde_json::Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+    Ok(val
+        .get("text")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string())
 }
 
 fn to_mono_16k(input: &[f32], sample_rate: u32, channels: u16) -> Vec<f32> {
@@ -156,7 +771,7 @@ fn to_mono_16k(input: &[f32], sample_rate: u32, channels: u16) -> Vec<f32> {
     out
 }
 
-fn stop_inner(state: &AppState) -> Result<String, String> {
+fn stop_inner(state: &AppState) -> Result<(String, u64, String, String), String> {
     let sess = {
         let mut g = state.session.lock().unwrap();
         g.take()
@@ -169,30 +784,76 @@ fn stop_inner(state: &AppState) -> Result<String, String> {
     let raw = sess.samples.lock().unwrap().clone();
     let sr = *sess.sample_rate.lock().unwrap();
     let ch = *sess.channels.lock().unwrap();
-    if raw.is_empty() {
-        return Err("no audio captured".into());
+    let duration_ms = sess.started_at.elapsed().as_millis() as u64;
+    if duration_ms < 300 || raw.is_empty() {
+        return Err("too short".into());
     }
-    let pcm = to_mono_16k(&raw, sr, ch);
+    let mut pcm = to_mono_16k(&raw, sr, ch);
+    normalize_peak(&mut pcm);
+    let pcm = trim_silence(&pcm, 16000);
+    if pcm.len() < 16000 / 4 {
+        return Err("no speech detected".into());
+    }
 
-    let model = ensure_model().map_err(|e| format!("model: {}", e))?;
+    let (provider, language, groq_key, groq_model) = {
+        let s = state.settings.lock().unwrap();
+        (
+            s.provider.clone(),
+            s.language.clone(),
+            s.groq_api_key.clone(),
+            s.groq_model.clone(),
+        )
+    };
+
+    let voice_prompt = voice_profile_prompt();
+
+    if provider == "groq" {
+        let text = transcribe_groq(
+            &pcm, 16000, &groq_key, &groq_model, &language, &voice_prompt,
+        )?;
+        return Ok((text, duration_ms, "groq".into(), groq_model));
+    }
+
+    let (model_path, model_id) = ensure_active_model(state).map_err(|e| format!("model: {}", e))?;
 
     let mut wlock = state.whisper.lock().unwrap();
-    if wlock.is_none() {
+    let need_reload = wlock
+        .as_ref()
+        .map(|(id, _)| id != &model_id)
+        .unwrap_or(true);
+    if need_reload {
         let ctx = WhisperContext::new_with_params(
-            model.to_str().unwrap(),
+            model_path.to_str().unwrap(),
             WhisperContextParameters::default(),
         )
         .map_err(|e| format!("whisper init: {}", e))?;
-        *wlock = Some(ctx);
+        *wlock = Some((model_id.clone(), ctx));
     }
-    let ctx = wlock.as_ref().unwrap();
+    let ctx = &wlock.as_ref().unwrap().1;
     let mut state_w = ctx.create_state().map_err(|e| e.to_string())?;
-    let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
+    let mut params = FullParams::new(SamplingStrategy::BeamSearch {
+        beam_size: 5,
+        patience: 1.0,
+    });
     params.set_print_progress(false);
     params.set_print_special(false);
     params.set_print_realtime(false);
     params.set_print_timestamps(false);
-    params.set_language(Some("en"));
+    params.set_suppress_blank(true);
+    params.set_no_context(true);
+    if !voice_prompt.is_empty() {
+        params.set_initial_prompt(&voice_prompt);
+    }
+    let lang_opt = if language.is_empty() || language == "auto" {
+        None
+    } else {
+        Some(language.as_str())
+    };
+    if find_model(&model_id).map(|m| m.lang == "en").unwrap_or(false) {
+        params.set_language(Some("en"));
+    } else {
+        params.set_language(lang_opt);
+    }
     state_w.full(params, &pcm).map_err(|e| e.to_string())?;
     let n = state_w.full_n_segments().map_err(|e| e.to_string())?;
     let mut out = String::new();
@@ -201,57 +862,174 @@ fn stop_inner(state: &AppState) -> Result<String, String> {
             out.push_str(&seg);
         }
     }
-    Ok(out.trim().to_string())
+    Ok((out.trim().to_string(), duration_ms, "local".into(), model_id))
 }
 
-fn deliver_text(text: &str) {
+fn record_history(text: &str, duration_ms: u64, provider: &str, model: &str) {
+    if text.trim().is_empty() {
+        return;
+    }
+    let entry = HistoryEntry {
+        id: format!("{}-{}", now_secs(), text.len()),
+        ts: now_secs(),
+        text: text.to_string(),
+        duration_ms,
+        provider: provider.to_string(),
+        model: model.to_string(),
+        words: count_words(text),
+        flagged: false,
+    };
+    let _ = append_history(&entry);
+}
+
+#[tauri::command]
+fn list_groq_models() -> Vec<String> {
+    GROQ_MODELS.iter().map(|s| s.to_string()).collect()
+}
+
+#[tauri::command]
+async fn test_groq(api_key: String) -> Result<String, String> {
+    if api_key.trim().is_empty() {
+        return Err("API key empty".into());
+    }
+    let resp = ureq::get("https://api.groq.com/openai/v1/models")
+        .set("Authorization", &format!("Bearer {}", api_key))
+        .call()
+        .map_err(|e| match e {
+            ureq::Error::Status(code, r) => {
+                format!("HTTP {}: {}", code, r.into_string().unwrap_or_default())
+            }
+            ureq::Error::Transport(t) => format!("transport: {}", t),
+        })?;
+    let _ = resp.into_string();
+    Ok("Groq API key works.".into())
+}
+
+fn deliver_text(text: &str, auto_paste: bool) {
     if text.is_empty() {
         return;
     }
     if let Ok(mut cb) = arboard::Clipboard::new() {
         let _ = cb.set_text(text.to_string());
     }
-    if let Ok(mut enigo) = Enigo::new(&Settings::default()) {
-        let _ = enigo.text(text);
+    if auto_paste {
+        if let Ok(mut enigo) = Enigo::new(&EnigoSettings::default()) {
+            let _ = enigo.text(text);
+        }
+    }
+}
+
+fn position_hud(app: &AppHandle) {
+    if let Some(win) = app.get_webview_window("hud") {
+        if let Ok(Some(monitor)) = win.current_monitor() {
+            let size = monitor.size();
+            let scale = monitor.scale_factor();
+            let win_w = (360.0 * scale) as i32;
+            let win_h = (96.0 * scale) as i32;
+            let x = (size.width as i32 - win_w) / 2;
+            let y = size.height as i32 - win_h - (60.0 * scale) as i32;
+            let _ = win.set_position(PhysicalPosition::new(x, y));
+        }
+    }
+}
+
+fn show_hud(app: &AppHandle, state: &str) {
+    if let Some(win) = app.get_webview_window("hud") {
+        position_hud(app);
+        let _ = win.show();
+    }
+    let _ = app.emit("rec-state", state);
+}
+
+fn hide_hud(app: &AppHandle) {
+    if let Some(win) = app.get_webview_window("hud") {
+        let _ = win.hide();
     }
 }
 
 #[tauri::command]
-fn start_recording(state: State<'_, AppState>) -> Result<(), String> {
-    start_inner(&state)
+fn open_settings(app: AppHandle) -> Result<(), String> {
+    if let Some(win) = app.get_webview_window("settings") {
+        let _ = win.show();
+        let _ = win.set_focus();
+    }
+    Ok(())
 }
 
 #[tauri::command]
-async fn stop_recording(state: State<'_, AppState>) -> Result<String, String> {
-    let text = stop_inner(&state)?;
-    let t = text.clone();
-    thread::spawn(move || {
-        thread::sleep(Duration::from_millis(300));
-        deliver_text(&t);
-    });
-    Ok(text)
+fn start_recording(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    start_inner(&state)?;
+    show_hud(&app, "recording");
+    Ok(())
 }
 
-fn toggle_via_hotkey(app: &AppHandle) {
+#[tauri::command]
+async fn stop_recording(app: AppHandle, state: State<'_, AppState>) -> Result<String, String> {
+    let _ = app.emit("rec-state", "transcribing");
+    let auto_paste = state.settings.lock().unwrap().auto_paste;
+    let res = stop_inner(&state);
+    match res {
+        Ok((text, dur, provider, model)) => {
+            record_history(&text, dur, &provider, &model);
+            let _ = app.emit("transcript", &text);
+            let _ = app.emit("history-changed", ());
+            let _ = app.emit("rec-state", "done");
+            let app2 = app.clone();
+            let t = text.clone();
+            thread::spawn(move || {
+                thread::sleep(Duration::from_millis(250));
+                deliver_text(&t, auto_paste);
+                thread::sleep(Duration::from_millis(800));
+                hide_hud(&app2);
+            });
+            Ok(text)
+        }
+        Err(e) => {
+            let _ = app.emit("rec-error", &e);
+            let _ = app.emit("rec-state", "idle");
+            let app2 = app.clone();
+            thread::spawn(move || {
+                thread::sleep(Duration::from_millis(700));
+                hide_hud(&app2);
+            });
+            Err(e)
+        }
+    }
+}
+
+fn handle_hotkey(app: &AppHandle, pressed: bool) {
     let state = app.state::<AppState>();
-    let recording = state.session.lock().unwrap().is_some();
-    let app2 = app.clone();
-    if !recording {
+    if pressed {
+        if state.session.lock().unwrap().is_some() {
+            return;
+        }
         let _ = start_inner(&state);
-        let _ = app.emit("rec-state", "recording");
+        show_hud(app, "recording");
     } else {
-        std::thread::spawn(move || {
+        if state.session.lock().unwrap().is_none() {
+            return;
+        }
+        let app2 = app.clone();
+        let _ = app.emit("rec-state", "transcribing");
+        thread::spawn(move || {
             let st = app2.state::<AppState>();
+            let auto_paste = st.settings.lock().unwrap().auto_paste;
             match stop_inner(&st) {
-                Ok(text) => {
+                Ok((text, dur, provider, model)) => {
+                    record_history(&text, dur, &provider, &model);
                     let _ = app2.emit("transcript", &text);
-                    let _ = app2.emit("rec-state", "idle");
-                    std::thread::sleep(Duration::from_millis(300));
-                    deliver_text(&text);
+                    let _ = app2.emit("history-changed", ());
+                    let _ = app2.emit("rec-state", "done");
+                    thread::sleep(Duration::from_millis(250));
+                    deliver_text(&text, auto_paste);
+                    thread::sleep(Duration::from_millis(800));
+                    hide_hud(&app2);
                 }
                 Err(e) => {
-                    let _ = app2.emit("rec-error", e);
+                    let _ = app2.emit("rec-error", &e);
                     let _ = app2.emit("rec-state", "idle");
+                    thread::sleep(Duration::from_millis(700));
+                    hide_hud(&app2);
                 }
             }
         });
@@ -260,26 +1038,53 @@ fn toggle_via_hotkey(app: &AppHandle) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let initial = load_settings();
+    let state = AppState {
+        settings: Mutex::new(initial),
+        ..Default::default()
+    };
+
     tauri::Builder::default()
-        .manage(AppState::default())
+        .manage(state)
         .plugin(tauri_plugin_opener::init())
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
                 .with_handler(|app, shortcut, event| {
-                    if event.state == ShortcutState::Pressed
-                        && shortcut.matches(Modifiers::CONTROL | Modifiers::ALT, Code::Space)
-                    {
-                        toggle_via_hotkey(app);
+                    if shortcut.matches(Modifiers::CONTROL | Modifiers::SHIFT, Code::Space) {
+                        match event.state {
+                            ShortcutState::Pressed => handle_hotkey(app, true),
+                            ShortcutState::Released => handle_hotkey(app, false),
+                        }
                     }
                 })
                 .build(),
         )
         .setup(|app| {
-            let sc = Shortcut::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::Space);
+            let sc = Shortcut::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::Space);
             app.global_shortcut().register(sc)?;
+            if let Some(hud) = app.get_webview_window("hud") {
+                let _ = hud.hide();
+            }
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![start_recording, stop_recording])
+        .invoke_handler(tauri::generate_handler![
+            start_recording,
+            stop_recording,
+            list_models,
+            download_model,
+            delete_model,
+            set_active_model,
+            get_settings,
+            update_settings,
+            open_settings,
+            list_groq_models,
+            test_groq,
+            list_history,
+            delete_history_item,
+            flag_history_item,
+            clear_history,
+            get_stats,
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
