@@ -5,7 +5,7 @@
 :root,
 :root[data-theme="dark"] {
   /* Force light theme regardless of system preference */
-  --bg: #F5F5F4;
+  --bg: #FFFFFF;
   --sidebar-bg: #FAFAF8;
   --panel: #FFFFFF;
   --panel-2: #F8F7F4;
@@ -33,7 +33,7 @@
 
 @media (prefers-color-scheme: dark) {
   :root {
-    --bg: #F5F5F4;
+    --bg: #FFFFFF;
     --sidebar-bg: #FAFAF8;
     --panel: #FFFFFF;
     --panel-2: #F8F7F4;
@@ -276,29 +276,26 @@ body.with-sidebar.sidebar-collapsed .topbar-toggle {
   height: calc(100vh - 44px);
 }
 
-.main > .col {
-  background: var(--panel);
-  margin: 14px auto;
-  border: 1px solid var(--border);
-  border-radius: 14px;
-  padding: 32px 36px;
-  min-height: calc(100vh - 44px - 28px);
-  display: block !important;
-  max-width: 1100px;
-}
-/* When sidebar is collapsed, fill main column edge-to-edge for a clean
-   fullscreen feel — no warm bg gap on either side. */
-body.with-sidebar.sidebar-collapsed .main {
+/* Main column fills the available width edge-to-edge so the warm bg
+   never bleeds through. Inner content still capped to 1100px via
+   responsive padding so long lines stay readable. */
+.main {
   background: var(--panel) !important;
 }
-body.with-sidebar.sidebar-collapsed .main > .col {
-  max-width: 100% !important;
+.topbar {
+  background: var(--panel) !important;
+}
+.main > .col {
+  background: var(--panel);
   margin: 0 !important;
   border: none !important;
   border-radius: 0 !important;
-  padding: 32px max(36px, calc((100% - 1100px) / 2)) !important;
+  padding: 28px max(28px, calc((100% - 1100px) / 2)) !important;
+  min-height: calc(100vh - 44px);
+  display: block !important;
+  max-width: 100% !important;
 }
-body.with-sidebar.sidebar-collapsed .topbar {
+body.with-sidebar.sidebar-collapsed .main {
   background: var(--panel) !important;
 }
 
@@ -336,20 +333,24 @@ body.with-sidebar.sidebar-collapsed .topbar {
 .hero-card > *:not(.hero-collapse) { position: relative; z-index: 1; }
 
 .hero-card h2 {
-  font-family: "Tiempos Headline", "EB Garamond", Georgia, "Times New Roman", serif !important;
-  font-size: 26px !important;
-  font-weight: 400 !important;
+  font-family: Georgia, "Times New Roman", "EB Garamond", "Tiempos Headline", serif !important;
+  font-size: 24px !important;
+  font-weight: 500 !important;
   color: var(--text) !important;
-  letter-spacing: -0.4px !important;
-  line-height: 1.25 !important;
+  letter-spacing: -0.3px !important;
+  line-height: 1.3 !important;
   margin-bottom: 10px !important;
+  opacity: 1 !important;
 }
 .hero-card h2 em {
   font-style: italic !important;
   font-family: inherit !important;
-  font-weight: 500 !important;
+  font-weight: 600 !important;
   color: var(--text) !important;
   opacity: 1 !important;
+  text-shadow: none !important;
+  background: none !important;
+  -webkit-text-fill-color: var(--text) !important;
 }
 .hero-card h2 strong {
   font-weight: 600;
@@ -428,14 +429,24 @@ body.with-sidebar.sidebar-collapsed .topbar {
   color: var(--text) !important;
 }
 
-/* Force hero content visible — override compact-mode hiding */
+/* Compact (collapsed) hero — small banner with only the CTA visible */
+.hero-card.compact {
+  padding: 12px 16px !important;
+  display: flex !important;
+  align-items: center !important;
+  gap: 12px !important;
+}
 .hero-card.compact h2,
 .hero-card.compact p,
 .hero-card.compact .row.kbd-hints {
-  display: revert !important;
+  display: none !important;
 }
-.hero-card.compact { padding: 26px 28px !important; }
-.hero-card.compact .actions { margin-top: 14px !important; }
+.hero-card.compact .actions {
+  margin-top: 0 !important;
+  flex: 1 !important;
+}
+.hero-card.compact .hero-collapse svg { transform: rotate(180deg); }
+.hero-card .hero-collapse svg { transition: transform 200ms ease; }
 
 /* Status text */
 #status {
